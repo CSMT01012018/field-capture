@@ -107,6 +107,10 @@
   .lib-meta .cloud.synced { color: var(--ok); }
   .lib-meta .cloud.err { color: var(--red); }
   .lib-thumbs-row { display: flex; gap: 5px; margin-top: 10px; }
+  .lib-del { flex: none; background: transparent; border: 1px solid var(--edge);
+    border-radius: 10px; color: var(--text-dim); font-size: 17px; width: 40px; height: 40px;
+    cursor: pointer; line-height: 1; }
+  .lib-del:active { background: var(--surface-2); }
   .lib-empty { text-align: center; color: var(--text-dim); padding: 50px 20px; font-size: 14px; line-height: 1.6; }
   .dbx-box { background: var(--surface); border: 1px solid var(--edge); border-radius: 14px; padding: 16px; margin-bottom: 16px; }
   .dbx-row { display: flex; align-items: center; gap: 12px; }
@@ -486,6 +490,18 @@ async function refreshExistingNos() {
   const samples = await getAllSamples();
   existingNos = new Set(samples.map(s => s.no));
 }
+function nextSampleNo() {
+  if (!existingNos.size) return 1;
+  return Math.max(...Array.from(existingNos)) + 1;
+}
+function suggestSampleNo() {
+  const field = document.getElementById("sampleNo");
+  if (Object.keys(currentPhotos).length > 0) return;
+  if (field.value.trim() !== "") return;
+  field.value = nextSampleNo();
+  document.getElementById("warnDup").style.display = "none";
+  renderFaceGrid();
+}
 document.getElementById("sampleNo").addEventListener("input", () => {
   renderFaceGrid();
   const no = getSampleNo();
@@ -567,9 +583,10 @@ function showConfirm(sample) {
   refreshLib();
 }
 
-document.getElementById("nextSampleBtn").onclick = () => {
+document.getElementById("nextSampleBtn").onclick = async () => {
   const cur = getSampleNo();
-  document.getElementById("sampleNo").value = cur ? cur + 1 : "";
+  await refreshExistingNos();
+  document.getElementById("sampleNo").value = cur ? cur + 1 : nextSampleNo();
   document.getElementById("warnDup").style.display = "none";
   const no = getSampleNo();
   if (no && existingNos.has(no)) document.getElementById("warnDup").style.display = "block";
@@ -607,8 +624,19 @@ async function refreshLib() {
     return '<div class="lib-item"><div class="lib-item-top">' +
       '<div class="lib-meta"><b>' + s.id + '</b><small>4 vues · ' +
       new Date(s.createdAt).toLocaleDateString('fr-FR') + ' · <span class="cloud ' + syncCls + '">' + syncTxt + '</span></small></div>' +
+      '<button class="lib-del" data-id="' + s.id + '" title="Supprimer cet échantillon">🗑</button>' +
       '</div><div class="lib-thumbs-row">' + thumbs + '</div></div>';
   }).join("");
+  document.querySelectorAll(".lib-del").forEach(btn => {
+    btn.onclick = async () => {
+      const id = btn.dataset.id;
+      if (!confirm("Supprimer " + id + " du téléphone ?\n\nCela retire uniquement l'échantillon de cet appareil. Les photos déjà envoyées sur Dropbox ne sont pas supprimées.")) return;
+      await deleteSample(id);
+      await refreshExistingNos();
+      refreshLib();
+      toast(id + " supprimé");
+    };
+  });
 }
 
 function refreshDbxUI() {
@@ -674,7 +702,11 @@ function showScreen(name) {
     b.classList.toggle("active", b.dataset.nav === name || (name==="confirm" && b.dataset.nav==="capture")));
 }
 document.querySelectorAll("nav button").forEach(b => {
-  b.onclick = () => { showScreen(b.dataset.nav); if (b.dataset.nav === "lib") { refreshLib(); refreshDbxUI(); } };
+  b.onclick = async () => {
+    showScreen(b.dataset.nav);
+    if (b.dataset.nav === "lib") { refreshLib(); refreshDbxUI(); }
+    if (b.dataset.nav === "capture") { await refreshExistingNos(); suggestSampleNo(); }
+  };
 });
 
 /* ====== TOAST ====== */
@@ -699,6 +731,7 @@ if ("serviceWorker" in navigator) {
   await dbxHandleRedirect();
   await refreshExistingNos();
   updateNet();
+  suggestSampleNo();
   renderFaceGrid();
   refreshLib();
   refreshDbxUI();
