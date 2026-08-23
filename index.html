@@ -95,6 +95,10 @@
   .lib-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
   .lib-head h2 { font-size: 17px; font-weight: 650; }
   .lib-count { font-size: 12px; color: var(--text-dim); }
+  .mem-bar { display: none; font-size: 12.5px; padding: 9px 12px; border-radius: 8px; margin-bottom: 12px; line-height: 1.4; }
+  .mem-bar.ok { background: rgba(255,255,255,0.05); color: var(--text-dim); }
+  .mem-bar.warn { background: rgba(214,167,74,0.15); color: var(--gold); }
+  .mem-bar.danger { background: rgba(200,60,60,0.18); color: #ff8a8a; font-weight: 600; }
   .lib-item { background: var(--surface); border: 1px solid var(--edge); border-radius: 12px;
     padding: 12px 14px; margin-bottom: 10px; }
   .lib-item-top { display: flex; align-items: center; gap: 12px; }
@@ -173,15 +177,28 @@
   <main>
     <section class="screen active" id="screen-capture">
       <div class="sample-box">
+        <div class="label">Campagne</div>
+        <div class="sample-input">
+          <input type="text" id="campaign" placeholder="2026-08">
+        </div>
+        <div class="hint">Se remplit avec le mois en cours. Corrige-la au début d'une nouvelle campagne.</div>
+      </div>
+      <div class="sample-box">
         <div class="label">Numéro d'échantillon</div>
         <div class="sample-input">
-          <span class="pfx">Ech</span>
+          <span class="pfx">PALM-</span>
           <input type="number" id="sampleNo" inputmode="numeric" placeholder="1" min="1">
         </div>
-        <div class="hint">Saisis le numéro du fruit tel que sur ta fiche NIR. Les 4 photos porteront ce numéro.</div>
+        <div class="hint">Saisis le numéro du régime tel que sur ta fiche NIR. Les 4 photos porteront ce numéro.</div>
         <div class="warn-dup" id="warnDup">⚠ Ce numéro existe déjà dans la base. Enregistrer écrasera l'échantillon précédent.</div>
       </div>
-      <div class="label">Les 4 vues du fruit</div>
+      <div class="sample-box">
+        <div class="label">Note (optionnel)</div>
+        <div class="sample-input">
+          <input type="text" id="sampleNote" placeholder="ex. sur-mûr, tache, atypique">
+        </div>
+      </div>
+      <div class="label">Les 4 vues du régime</div>
       <div class="faces" id="faceGrid"></div>
       <button class="btn btn-primary" id="saveBtn" disabled>Enregistrer l'échantillon</button>
     </section>
@@ -209,8 +226,9 @@
       </div>
       <div class="lib-head">
         <h2>Base locale</h2>
-        <span class="lib-count" id="libCount">0 fruits</span>
+        <span class="lib-count" id="libCount">0 régime</span>
       </div>
+      <div id="memBar" class="mem-bar"></div>
       <div id="libList"></div>
       <button class="btn btn-blue" id="syncBtn" style="margin-top:14px; display:none">Synchroniser vers Dropbox</button>
       <button class="btn btn-danger" id="purgeBtn" style="margin-top:10px; display:none">Vider les échantillons déjà sur Dropbox</button>
@@ -262,6 +280,34 @@
   if (link) link.href = url;
 })();
 
+/* ====== CAMPAGNE + GPS ====== */
+function defaultCampaign() {
+  const d = new Date();
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+}
+function getCampaign() {
+  const el = document.getElementById("campaign");
+  const v = el && el.value.trim() ? el.value.trim() : defaultCampaign();
+  return v.replace(/[^0-9A-Za-z_-]/g, "");
+}
+let lastGPS = { lat: null, lon: null, acc: null };
+function refreshGPS() {
+  if (!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(
+    p => { lastGPS = { lat: +p.coords.latitude.toFixed(6), lon: +p.coords.longitude.toFixed(6), acc: Math.round(p.coords.accuracy) }; },
+    () => {}, { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
+  );
+}
+function getGPS() {
+  return new Promise(res => {
+    if (!navigator.geolocation) return res({ lat: null, lon: null, acc: null });
+    navigator.geolocation.getCurrentPosition(
+      p => { lastGPS = { lat: +p.coords.latitude.toFixed(6), lon: +p.coords.longitude.toFixed(6), acc: Math.round(p.coords.accuracy) }; res(lastGPS); },
+      () => res(lastGPS), { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
+    );
+  });
+}
+
 /* ====== CONFIG DROPBOX ====== */
 const DBX_APP_KEY = "82m9c5qb8ury301";
 const DBX_FOLDER = "/field palm captures";
@@ -269,13 +315,13 @@ const REDIRECT_URI = window.location.origin + window.location.pathname;
 
 /* ====== VUES DU FRUIT ====== */
 const FACES = [
-  { key: "Face",   label: "Face",   sub: "vue de depart" },
-  { key: "Oppose", label: "Oppose", sub: "180°" },
-  { key: "Gauche", label: "Gauche", sub: "90° gauche" },
-  { key: "Droit",  label: "Droit",  sub: "90° droit" }
+  { key: "front", label: "Front", sub: "vue de face", idx: 0 },
+  { key: "back",  label: "Back",  sub: "180°",        idx: 1 },
+  { key: "left",  label: "Left",  sub: "90° gauche",  idx: 2 },
+  { key: "right", label: "Right", sub: "90° droit",   idx: 3 }
 ];
 const JPEG_QUALITY = 0.95;
-const TARGET_RES = 2560;
+const TARGET_RES = 4096;
 
 let currentPhotos = {};
 let activeFace = null;
@@ -415,17 +461,46 @@ async function dbxUploadFile(path, blob) {
   return resp.json();
 }
 
-/* ====== SYNCHRO ROBUSTE ====== */
+/* ====== SYNCHRO ROBUSTE (tout ou rien par régime) ====== */
+function campaignFolder(sample) {
+  const c = (sample.campaign || "sans_campagne").replace(/[^0-9A-Za-z_-]/g, "");
+  return DBX_FOLDER + "/" + c + "_campagne";
+}
 async function syncSample(sample) {
+  const folder = campaignFolder(sample);
+  // Les 4 photos doivent toutes passer, sinon le régime reste en attente entier
   for (const p of sample.photos) {
     const blob = dataURLtoBlob(p.data);
-    await dbxUploadFile(DBX_FOLDER + "/" + p.filename, blob);
+    await dbxUploadFile(folder + "/" + p.filename, blob);
   }
   sample.cloudSynced = true;
   sample.syncError = null;
   sample.syncedAt = new Date().toISOString();
   await saveSample(sample);
+  // Met à jour le CSV de métadonnées de la campagne
+  try { await uploadCampaignCSV(sample.campaign); } catch (e) {}
   return sample;
+}
+
+/* CSV de métadonnées par campagne : le pont vers le NIR */
+async function uploadCampaignCSV(campaign) {
+  const all = await getAllSamples();
+  const rows = all.filter(s => (s.campaign || "") === campaign && s.cloudSynced);
+  if (!rows.length) return;
+  const header = ["campagne","numero","id","date_heure_locale","latitude","longitude","precision_m","note","fichiers"];
+  const lines = [header.join(",")];
+  rows.sort((a,b) => a.no - b.no).forEach(s => {
+    const files = s.photos.map(p => p.filename).join(" | ");
+    const cell = v => {
+      const t = (v === null || v === undefined) ? "" : String(v);
+      return /[",\n]/.test(t) ? '"' + t.replace(/"/g,'""') + '"' : t;
+    };
+    lines.push([s.campaign, s.no, s.id, s.localTime || s.createdAt, s.lat, s.lon, s.gpsAcc, s.note || "", files].map(cell).join(","));
+  });
+  const csv = lines.join("\n");
+  const folder = DBX_FOLDER + "/" + campaign.replace(/[^0-9A-Za-z_-]/g,"") + "_campagne";
+  const blob = new Blob(["\ufeff" + csv], { type: "text/csv" });
+  await dbxUploadFile(folder + "/_metadata_" + campaign.replace(/[^0-9A-Za-z_-]/g,"") + ".csv", blob);
 }
 let syncing = false;
 async function syncAllPending(showToast) {
@@ -517,7 +592,7 @@ async function openCamera(faceIdx) {
   document.getElementById("cam").classList.add("active");
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "environment", width: { ideal: TARGET_RES }, height: { ideal: TARGET_RES } }, audio: false
+      video: { facingMode: "environment", width: { ideal: 4096 }, height: { ideal: 3072 } }, audio: false
     });
     document.getElementById("video").srcObject = stream;
   } catch (e) { toast("Caméra inaccessible"); closeCamera(); }
@@ -530,24 +605,33 @@ document.getElementById("camClose").onclick = closeCamera;
 document.getElementById("shutter").onclick = () => {
   const v = document.getElementById("video");
   const c = document.getElementById("canvas");
-  const size = Math.min(v.videoWidth, v.videoHeight);
-  c.width = size; c.height = size;
+  c.width = v.videoWidth; c.height = v.videoHeight;
   const ctx = c.getContext("2d");
-  const sx = (v.videoWidth - size) / 2, sy = (v.videoHeight - size) / 2;
-  ctx.drawImage(v, sx, sy, size, size, 0, 0, size, size);
+  ctx.drawImage(v, 0, 0, v.videoWidth, v.videoHeight);
   currentPhotos[activeFace] = c.toDataURL("image/jpeg", JPEG_QUALITY);
   closeCamera(); renderFaceGrid();
-  toast(FACES[activeFace].label + " capturée");
+  toast(FACES[activeFace].label + " capturée · " + v.videoWidth + "×" + v.videoHeight);
 };
 
 document.getElementById("saveBtn").onclick = async () => {
   const no = getSampleNo();
-  const id = "Ech" + String(no).padStart(3, "0");
+  const id = "PALM-" + no;
+  const campaign = getCampaign();
+  const gps = await getGPS();
+  const baseTs = Date.now();
   const photos = FACES.map((f, i) => ({
-    filename: id + "_" + (i+1) + "_" + f.key + ".jpg",
+    filename: id + "_" + f.key + "_" + (baseTs + i) + "_" + f.idx + ".jpg",
     data: currentPhotos[i]
   }));
-  const sample = { id, no, photos, createdAt: new Date().toISOString(), cloudSynced: false, syncedAt: null, syncError: null };
+  const sample = {
+    id, no, campaign, photos,
+    createdAt: new Date().toISOString(),
+    localTime: new Date().toLocaleString("fr-FR"),
+    lat: gps.lat, lon: gps.lon, gpsAcc: gps.acc,
+    device: navigator.userAgent,
+    note: document.getElementById("sampleNote") ? document.getElementById("sampleNote").value.trim() : "",
+    cloudSynced: false, syncedAt: null, syncError: null
+  };
   await saveSample(sample);
   await refreshExistingNos();
   showConfirm(sample);
@@ -590,6 +674,8 @@ document.getElementById("nextSampleBtn").onclick = async () => {
   document.getElementById("warnDup").style.display = "none";
   const no = getSampleNo();
   if (no && existingNos.has(no)) document.getElementById("warnDup").style.display = "block";
+  const noteEl = document.getElementById("sampleNote");
+  if (noteEl) noteEl.value = "";
   renderFaceGrid();
   showScreen("capture");
 };
@@ -597,13 +683,30 @@ document.getElementById("nextSampleBtn").onclick = async () => {
 /* ====== BASE / LIB ====== */
 async function refreshLib() {
   const samples = await getAllSamples();
-  document.getElementById("libCount").textContent = samples.length + (samples.length > 1 ? " fruits" : " fruit");
+  document.getElementById("libCount").textContent = samples.length + (samples.length > 1 ? " régimes" : " régime");
   const pending = samples.filter(s => !s.cloudSynced).length;
   const synced = samples.filter(s => s.cloudSynced).length;
+
+  // Estimation mémoire des régimes en attente
+  const pendingSamples = samples.filter(s => !s.cloudSynced);
+  let bytes = 0;
+  pendingSamples.forEach(s => s.photos.forEach(p => { bytes += (p.data ? p.data.length * 0.75 : 0); }));
+  const mb = bytes / (1024 * 1024);
+  const memBar = document.getElementById("memBar");
+  if (pending === 0) {
+    memBar.style.display = "none";
+  } else {
+    memBar.style.display = "block";
+    let cls = "ok", msg = "";
+    if (pending >= 30) { cls = "danger"; msg = " · pense à synchroniser et vider"; }
+    else if (pending >= 15) { cls = "warn"; msg = " · trouve du réseau bientôt"; }
+    memBar.className = "mem-bar " + cls;
+    memBar.textContent = pending + " régime(s) en attente · ~" + mb.toFixed(0) + " Mo sur le téléphone" + msg;
+  }
   const syncBtn = document.getElementById("syncBtn");
   if (isDbxConnected() && pending > 0) {
     syncBtn.style.display = "flex";
-    syncBtn.textContent = "Synchroniser " + pending + " échantillon(s) vers Dropbox";
+    syncBtn.textContent = "Synchroniser maintenant (" + pending + " en attente)";
   } else { syncBtn.style.display = "none"; }
   const purgeBtn = document.getElementById("purgeBtn");
   purgeBtn.style.display = (synced > 0) ? "flex" : "none";
@@ -611,7 +714,7 @@ async function refreshLib() {
 
   const list = document.getElementById("libList");
   if (!samples.length) {
-    list.innerHTML = '<div class="lib-empty">Aucun échantillon pour l\'instant.<br>Capture ton premier fruit depuis l\'onglet Capture.</div>';
+    list.innerHTML = '<div class="lib-empty">Aucun échantillon pour l\'instant.<br>Capture ton premier régime depuis l\'onglet Capture.</div>';
     return;
   }
   list.innerHTML = samples.map(s => {
@@ -731,6 +834,11 @@ if ("serviceWorker" in navigator) {
   await dbxHandleRedirect();
   await refreshExistingNos();
   updateNet();
+  // Pré-remplir la campagne au mois en cours
+  const campEl = document.getElementById("campaign");
+  if (campEl && !campEl.value) campEl.value = defaultCampaign();
+  // Pré-autoriser la géolocalisation une fois au démarrage
+  refreshGPS();
   suggestSampleNo();
   renderFaceGrid();
   refreshLib();
