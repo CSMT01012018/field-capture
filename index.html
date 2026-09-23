@@ -165,13 +165,14 @@
   .modal-box p { font-size: 14px; color: var(--text-dim); line-height: 1.6; margin-bottom: 20px; }
   .modal-actions { display: flex; gap: 10px; }
   .modal-actions .btn { margin: 0; }
+  .lib-thumb.cloudonly { display:inline-flex; align-items:center; justify-content:center; font-size:18px; opacity:.5; background: rgba(255,255,255,.05); }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <div class="logo"></div>
-    <div class="brand"><b>Field Capture</b><span>Samples · R&D</span></div>
+    <div class="brand"><b>Field Capture</b><span>Samples · R&D · v4.1</span></div>
     <div class="netdot" id="netdot"><i></i><span id="netlabel">Hors ligne</span></div>
   </header>
   <main>
@@ -327,14 +328,15 @@ let currentPhotos = {};
 let activeFace = null;
 let stream = null;
 
-/* ====== INDEXEDDB ====== */
+/* ====== INDEXEDDB v2 : métadonnées et photos séparées ====== */
 let db;
 function openDB() {
   return new Promise((res, rej) => {
-    const r = indexedDB.open("palmvision", 1);
+    const r = indexedDB.open("palmvision", 2);
     r.onupgradeneeded = e => {
       const d = e.target.result;
       if (!d.objectStoreNames.contains("samples")) d.createObjectStore("samples", { keyPath: "id" });
+      if (!d.objectStoreNames.contains("photos")) d.createObjectStore("photos", { keyPath: "filename" });
     };
     r.onsuccess = e => { db = e.target.result; res(); };
     r.onerror = e => rej(e);
@@ -347,13 +349,41 @@ function saveSample(obj) {
     tx.oncomplete = res; tx.onerror = rej;
   });
 }
-function deleteSample(id) {
+/* Enregistre en une seule transaction les métadonnées et les 4 photos binaires */
+function saveSampleWithPhotos(obj, photoRecords) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction(["samples", "photos"], "readwrite");
+    tx.objectStore("samples").put(obj);
+    photoRecords.forEach(p => tx.objectStore("photos").put(p));
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error);
+  });
+}
+function getPhoto(filename) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction("photos", "readonly");
+    const rq = tx.objectStore("photos").get(filename);
+    rq.onsuccess = () => res(rq.result || null);
+    rq.onerror = rej;
+  });
+}
+function deletePhotos(filenames) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction("photos", "readwrite");
+    filenames.forEach(f => tx.objectStore("photos").delete(f));
+    tx.oncomplete = res; tx.onerror = rej;
+  });
+}
+async function deleteSample(id) {
+  const tx0 = db.transaction("samples", "readonly");
+  const s = await new Promise(r => { const q = tx0.objectStore("samples").get(id); q.onsuccess = () => r(q.result); q.onerror = () => r(null); });
+  if (s && s.photos) await deletePhotos(s.photos.map(p => p.filename));
   return new Promise((res, rej) => {
     const tx = db.transaction("samples", "readwrite");
     tx.objectStore("samples").delete(id);
     tx.oncomplete = res; tx.onerror = rej;
   });
 }
+/* Ne lit que les métadonnées et les miniatures : jamais les photos pleine résolution */
 function getAllSamples() {
   return new Promise((res, rej) => {
     const tx = db.transaction("samples", "readonly");
@@ -361,6 +391,29 @@ function getAllSamples() {
     rq.onsuccess = () => res(rq.result.sort((a,b)=>a.no-b.no));
     rq.onerror = rej;
   });
+}
+function b64ToBuffer(dataURL) {
+  const bin = atob(dataURL.split(",")[1]);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr.buffer;
+}
+/* Migration des échantillons enregistrés par la v4 (photos en texte base64) */
+async function migrateV4() {
+  const all = await getAllSamples();
+  for (const s of all) {
+    if (!s.photos || !s.photos.some(p => typeof p.data === "string")) continue;
+    if (s.cloudSynced) {
+      // Déjà sur Dropbox : on retire simplement la photo lourde du téléphone
+      s.photos = s.photos.map(p => ({ filename: p.filename, thumb: null, size: 0, local: false }));
+      await saveSample(s);
+    } else {
+      // En attente : on convertit en binaire sans rien perdre
+      const recs = s.photos.map(p => ({ filename: p.filename, sampleId: s.id, buf: b64ToBuffer(p.data) }));
+      s.photos = s.photos.map((p, i) => ({ filename: p.filename, thumb: null, size: recs[i].buf.byteLength, local: true }));
+      await saveSampleWithPhotos(s, recs);
+    }
+  }
 }
 
 /* ====== DROPBOX AUTH (PKCE offline) ====== */
@@ -470,13 +523,17 @@ async function syncSample(sample) {
   const folder = campaignFolder(sample);
   // Les 4 photos doivent toutes passer, sinon le régime reste en attente entier
   for (const p of sample.photos) {
-    const blob = dataURLtoBlob(p.data);
-    await dbxUploadFile(folder + "/" + p.filename, blob);
+    const rec = await getPhoto(p.filename);
+    if (!rec) throw new Error("photo-absente:" + p.filename);
+    await dbxUploadFile(folder + "/" + p.filename, new Blob([rec.buf], { type: "image/jpeg" }));
   }
   sample.cloudSynced = true;
   sample.syncError = null;
   sample.syncedAt = new Date().toISOString();
+  // Les 4 photos sont confirmées sur Dropbox : on libère le téléphone (la miniature reste)
+  sample.photos = sample.photos.map(p => ({ filename: p.filename, thumb: p.thumb || null, size: p.size || 0, local: false }));
   await saveSample(sample);
+  try { await deletePhotos(sample.photos.map(p => p.filename)); } catch (e) {}
   // Met à jour le CSV de métadonnées de la campagne
   try { await uploadCampaignCSV(sample.campaign); } catch (e) {}
   return sample;
@@ -548,7 +605,7 @@ function renderFaceGrid() {
     const cell = document.createElement("div");
     cell.className = "face-cell" + (currentPhotos[i] ? " done" : "");
     cell.innerHTML = currentPhotos[i]
-      ? '<img src="' + currentPhotos[i] + '"><div class="check">✓</div><div class="retake">Reprendre</div>'
+      ? '<img src="' + currentPhotos[i].thumb + '"><div class="check">✓</div><div class="retake">Reprendre</div>'
       : '<div class="ico">📷</div><div class="n">' + f.label + '</div><div class="sub">' + f.sub + '</div><div class="check">✓</div>';
     cell.onclick = () => openCamera(i);
     g.appendChild(cell);
@@ -608,9 +665,22 @@ document.getElementById("shutter").onclick = () => {
   c.width = v.videoWidth; c.height = v.videoHeight;
   const ctx = c.getContext("2d");
   ctx.drawImage(v, 0, 0, v.videoWidth, v.videoHeight);
-  currentPhotos[activeFace] = c.toDataURL("image/jpeg", JPEG_QUALITY);
-  closeCamera(); renderFaceGrid();
-  toast(FACES[activeFace].label + " capturée · " + v.videoWidth + "×" + v.videoHeight);
+  const face = activeFace, w = v.videoWidth, h = v.videoHeight;
+  // Miniature légère pour l'affichage (environ 15 Ko)
+  const t = document.createElement("canvas");
+  const sc = 240 / Math.max(w, h);
+  t.width = Math.round(w * sc); t.height = Math.round(h * sc);
+  t.getContext("2d").drawImage(c, 0, 0, t.width, t.height);
+  const thumb = t.toDataURL("image/jpeg", 0.7);
+  t.width = t.height = 0;
+  closeCamera();
+  c.toBlob(blob => {
+    c.width = c.height = 0; // libère la mémoire graphique
+    if (!blob) { toast("Échec de la capture, recommence"); return; }
+    currentPhotos[face] = { blob, thumb };
+    renderFaceGrid();
+    toast(FACES[face].label + " capturée · " + w + "×" + h);
+  }, "image/jpeg", JPEG_QUALITY);
 };
 
 document.getElementById("saveBtn").onclick = async () => {
@@ -619,10 +689,13 @@ document.getElementById("saveBtn").onclick = async () => {
   const campaign = getCampaign();
   const gps = await getGPS();
   const baseTs = Date.now();
-  const photos = FACES.map((f, i) => ({
-    filename: id + "_" + f.key + "_" + (baseTs + i) + "_" + f.idx + ".jpg",
-    data: currentPhotos[i]
-  }));
+  const recs = [];
+  for (let i = 0; i < FACES.length; i++) {
+    const f = FACES[i];
+    recs.push({ filename: id + "_" + f.key + "_" + (baseTs + i) + "_" + f.idx + ".jpg", sampleId: id,
+                buf: await currentPhotos[i].blob.arrayBuffer() });
+  }
+  const photos = recs.map((r, i) => ({ filename: r.filename, thumb: currentPhotos[i].thumb, size: r.buf.byteLength, local: true }));
   const sample = {
     id, no, campaign, photos,
     createdAt: new Date().toISOString(),
@@ -632,7 +705,11 @@ document.getElementById("saveBtn").onclick = async () => {
     note: document.getElementById("sampleNote") ? document.getElementById("sampleNote").value.trim() : "",
     cloudSynced: false, syncedAt: null, syncError: null
   };
-  await saveSample(sample);
+  // Si le numéro existait déjà, on retire d'abord les anciennes photos
+  if (existingNos.has(no)) { try { await deleteSample(id); } catch (e) {} }
+  try { await saveSampleWithPhotos(sample, recs); }
+  catch (e) { toast("Mémoire du téléphone pleine : synchronise puis réessaie"); return; }
+  recs.length = 0;
   await refreshExistingNos();
   showConfirm(sample);
   currentPhotos = {};
@@ -690,7 +767,7 @@ async function refreshLib() {
   // Estimation mémoire des régimes en attente
   const pendingSamples = samples.filter(s => !s.cloudSynced);
   let bytes = 0;
-  pendingSamples.forEach(s => s.photos.forEach(p => { bytes += (p.data ? p.data.length * 0.75 : 0); }));
+  pendingSamples.forEach(s => s.photos.forEach(p => { bytes += (p.size || 0); }));
   const mb = bytes / (1024 * 1024);
   const memBar = document.getElementById("memBar");
   if (pending === 0) {
@@ -723,7 +800,9 @@ async function refreshLib() {
     else if (s.syncError) { syncTxt = '☁ échec, à réessayer'; syncCls = 'err'; }
     else if (isDbxConnected()) { syncTxt = '☁ en attente'; syncCls = ''; }
     else { syncTxt = '☁ local'; syncCls = ''; }
-    const thumbs = s.photos.map(p => '<img class="lib-thumb" src="' + p.data + '">').join("");
+    const thumbs = s.photos.map(p => p.thumb
+      ? '<img class="lib-thumb" src="' + p.thumb + '">'
+      : '<span class="lib-thumb cloudonly">☁</span>').join("");
     return '<div class="lib-item"><div class="lib-item-top">' +
       '<div class="lib-meta"><b>' + s.id + '</b><small>4 vues · ' +
       new Date(s.createdAt).toLocaleDateString('fr-FR') + ' · <span class="cloud ' + syncCls + '">' + syncTxt + '</span></small></div>' +
@@ -789,7 +868,12 @@ document.getElementById("exportBtn").onclick = async () => {
   if (!samples.length) { toast("Base vide"); return; }
   toast("Préparation de l'export…");
   const zip = new JSZip();
-  samples.forEach(s => s.photos.forEach(p => zip.file(p.filename, p.data.split(",")[1], { base64: true })));
+  let count = 0;
+  for (const s of samples) for (const p of s.photos) {
+    const rec = await getPhoto(p.filename);
+    if (rec) { zip.file(p.filename, rec.buf); count++; }
+  }
+  if (!count) { toast("Toutes les photos sont déjà sur Dropbox"); return; }
   const blob = await zip.generateAsync({ type: "blob" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -831,6 +915,7 @@ if ("serviceWorker" in navigator) {
 /* ====== BOOT ====== */
 (async function() {
   await openDB();
+  try { await migrateV4(); } catch (e) {}
   await dbxHandleRedirect();
   await refreshExistingNos();
   updateNet();
